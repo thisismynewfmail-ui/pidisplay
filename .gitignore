@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Built llama.cpp
+vendor/
+
+# Model weights: large, and licensed separately
+models/*
+!models/README.md
+!models/.gitkeep
+
+# Local state
+*.log
+transcripts/

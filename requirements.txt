@@ -1,0 +1,11 @@
+# Runtime dependencies.
+#
+# The keyboard, HTTP and configuration layers are written against the standard
+# library on purpose: this runs on a Raspberry Pi that may have no compiler and
+# no network at install time, and every dependency is another thing that can
+# turn a five-minute setup into an afternoon.
+#
+# smbus2 is the single exception. It wraps the /dev/i2c-N ioctls needed to send
+# a multi-byte I2C message in one transaction, which is what makes the display
+# fast enough to animate.
+smbus2>=0.4.2
