@@ -16,9 +16,9 @@ a typical differential repaint is under 2 ms.
 from __future__ import annotations
 
 import time
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
-from .emulator import PIN_BACKLIGHT, PIN_EN, PIN_RS
+from .pinmap import DEFAULT as DEFAULT_PINMAP, PinMap
 from .transport import I2CTransport, Transport, TransportError
 
 # Instruction set ------------------------------------------------------------
@@ -44,37 +44,121 @@ CANDIDATE_ADDRESSES = (0x27, 0x3F, 0x26, 0x3E, 0x20, 0x21, 0x22, 0x23,
                        0x24, 0x25, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D)
 
 
-def probe_addresses(bus: int = 1) -> List[int]:
-    """Return I2C addresses that answer on *bus* and look like a backpack.
+def list_buses() -> List[int]:
+    """Every I2C bus the kernel exposes, lowest first.
 
-    Probing is a zero-byte write, which is what ``i2cdetect`` does for this
-    address range; a PCF8574 acknowledges it without changing its outputs.
+    On a Pi 5 this is not just bus 1: the RP1 southbridge presents several
+    internal buses (HDMI DDC, camera, the RTC) alongside the GPIO header's,
+    and which number the header lands on has moved between kernel releases.
+    Scanning all of them means a header on an unexpected number is found
+    rather than reported as absent.
+    """
+    import glob
+    import re
+    buses = []
+    for path in glob.glob("/dev/i2c-*"):
+        match = re.search(r"/dev/i2c-(\d+)$", path)
+        if match:
+            buses.append(int(match.group(1)))
+    return sorted(buses)
+
+
+def probe_addresses(bus: int = 1,
+                    addresses: Sequence[int] = CANDIDATE_ADDRESSES) -> List[int]:
+    """Return I2C addresses that answer on *bus*.
+
+    Three probe methods are tried in the order ``i2cdetect`` prefers them,
+    because no single one works on every adapter:
+
+      1. SMBus quick write -- address plus the R/W bit and no data. This is
+         what ``i2cdetect`` uses for this address range and it cannot disturb
+         a PCF8574, whose outputs only latch on a real data byte.
+      2. A one-byte read. A PCF8574 answers this with its current port state,
+         so it is both safe and definitive.
+      3. A zero-length ``I2C_RDWR`` write, as a last resort. Some adapters
+         reject this outright, which is why it is not the first choice --
+         relying on it alone made the probe report nothing on hardware that
+         was working.
     """
     try:
         from smbus2 import SMBus, i2c_msg
     except ImportError:
         return []
+
     found = []
     try:
         with SMBus(bus) as smbus:
-            for address in CANDIDATE_ADDRESSES:
-                try:
-                    smbus.i2c_rdwr(i2c_msg.write(address, b""))
-                except OSError:
-                    continue
-                found.append(address)
+            for address in addresses:
+                if _address_responds(smbus, i2c_msg, address):
+                    found.append(address)
     except (OSError, IOError):
         return []
     return found
 
 
+def _address_responds(smbus, i2c_msg, address: int) -> bool:
+    for probe in (_probe_quick, _probe_read, _probe_empty_write):
+        result = probe(smbus, i2c_msg, address)
+        if result is True:
+            return True
+        if result is False:
+            return False           # the method worked and the address is idle
+    return False                   # every method was unsupported here
+
+
+def _probe_quick(smbus, _i2c_msg, address: int):
+    try:
+        smbus.write_quick(address)
+        return True
+    except OSError as exc:
+        import errno
+        # ENXIO / EREMOTEIO mean nothing acknowledged: a real, useful answer.
+        if exc.errno in (errno.ENXIO, errno.EREMOTEIO, errno.ETIMEDOUT):
+            return False
+        return None                # unsupported by this adapter; try the next
+    except (AttributeError, TypeError):
+        return None
+
+
+def _probe_read(smbus, _i2c_msg, address: int):
+    try:
+        smbus.read_byte(address)
+        return True
+    except OSError as exc:
+        import errno
+        if exc.errno in (errno.ENXIO, errno.EREMOTEIO, errno.ETIMEDOUT):
+            return False
+        return None
+    except (AttributeError, TypeError):
+        return None
+
+
+def _probe_empty_write(smbus, i2c_msg, address: int):
+    try:
+        smbus.i2c_rdwr(i2c_msg.write(address, b""))
+        return True
+    except OSError:
+        return False
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def scan_all_buses() -> List[Tuple[int, List[int]]]:
+    """``(bus, addresses)`` for every bus, including those with nothing on."""
+    return [(bus, probe_addresses(bus)) for bus in list_buses()]
+
+
 class CharacterLCD:
     """A 20x4 (or other geometry) HD44780 panel behind a PCF8574."""
 
-    def __init__(self, transport: Transport, cols: int = 20, rows: int = 4):
+    def __init__(self, transport: Transport, cols: int = 20, rows: int = 4,
+                 pinmap: Optional[PinMap] = None):
         self.transport = transport
         self.cols = cols
         self.rows = rows
+        self.pinmap = pinmap or DEFAULT_PINMAP
+        # Precomputed so the hot path does no bit shuffling per character.
+        self._nibbles = self.pinmap.nibble_table()
         self.row_offsets = self._row_offsets(cols, rows)
         self._backlight = True
         self._display_ctrl = CMD_DISPLAY_CTRL | DISPLAY_ON
@@ -97,7 +181,8 @@ class CharacterLCD:
 
     @classmethod
     def open_i2c(cls, bus: int = 1, address: int = 0x27, cols: int = 20,
-                 rows: int = 4, autodetect: bool = True) -> "CharacterLCD":
+                 rows: int = 4, autodetect: bool = True,
+                 pinmap: Optional[PinMap] = None) -> "CharacterLCD":
         """Open a panel on a real bus, optionally hunting for its address.
 
         Autodetection exists because these modules ship strapped to either 0x27
@@ -108,14 +193,15 @@ class CharacterLCD:
             found = probe_addresses(bus)
             if found and address not in found:
                 address = found[0]
-        lcd = cls(I2CTransport(bus=bus, address=address), cols=cols, rows=rows)
+        lcd = cls(I2CTransport(bus=bus, address=address), cols=cols, rows=rows,
+                  pinmap=pinmap)
         lcd.initialise()
         return lcd
 
     # -- byte encoding ------------------------------------------------------
 
     def _bl_bit(self) -> int:
-        return PIN_BACKLIGHT if self._backlight else 0
+        return self.pinmap.backlight_mask(self._backlight)
 
     def _encode(self, value: int, rs: int) -> List[int]:
         """One controller byte as six PCF8574 port bytes.
@@ -128,10 +214,11 @@ class CharacterLCD:
         debug.  The third write costs nothing worth having.
         """
         backlight = self._bl_bit()
-        high = (value & 0xF0) | rs | backlight
-        low = ((value << 4) & 0xF0) | rs | backlight
-        return [high, high | PIN_EN, high,
-                low, low | PIN_EN, low]
+        enable = self.pinmap.en_bit
+        high = self._nibbles[(value >> 4) & 0x0F] | rs | backlight
+        low = self._nibbles[value & 0x0F] | rs | backlight
+        return [high, high | enable, high,
+                low, low | enable, low]
 
     def _stage(self, data: Sequence[int]) -> None:
         self._pending.extend(data)
@@ -141,7 +228,7 @@ class CharacterLCD:
         self._address = None
 
     def _data(self, value: int) -> None:
-        self._stage(self._encode(value, PIN_RS))
+        self._stage(self._encode(value, self.pinmap.rs_bit))
 
     def flush(self) -> None:
         """Send everything staged so far as one or more I2C bursts."""
@@ -183,9 +270,10 @@ class CharacterLCD:
         self.initialised = True
 
     def _write_nibble(self, value: int) -> None:
+        """Send a single four-bit transfer, as the power-on handshake needs."""
         backlight = self._bl_bit()
-        byte = (value & 0xF0) | backlight
-        self._stage([byte, byte | PIN_EN, byte])
+        byte = self._nibbles[(value >> 4) & 0x0F] | backlight
+        self._stage([byte, byte | self.pinmap.en_bit, byte])
 
     # -- drawing -----------------------------------------------------------
 
@@ -239,6 +327,21 @@ class CharacterLCD:
         self._backlight = value
         # The backlight bit rides along with every transfer, so it takes effect
         # on the next byte regardless; sending a no-op keeps it immediate.
+        self._stage([self._bl_bit()])
+        self.flush()
+
+    def set_backlight_raw(self, on: bool) -> None:
+        """Drive only the backlight pin, bypassing the controller entirely.
+
+        This is the one operation that depends on no part of the HD44780
+        protocol -- not the pin mapping for RS, E or the data lines, not the
+        four-bit handshake, not contrast. If this makes the backlight change,
+        the bus, the address, the wiring and the power are all proven good and
+        the fault lies further up. The diagnostic in main.py bisects on exactly
+        that.
+        """
+        self._backlight = bool(on)
+        self._pending = []
         self._stage([self._bl_bit()])
         self.flush()
 

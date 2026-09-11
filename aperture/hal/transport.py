@@ -90,9 +90,10 @@ class EmulatedTransport(Transport):
     """
 
     def __init__(self, emulator=None, cols: int = 20, rows: int = 4,
-                 bus_hz: Optional[int] = None):
+                 bus_hz: Optional[int] = None, pinmap=None):
         from .emulator import HD44780Emulator
-        self.emulator = emulator or HD44780Emulator(cols=cols, rows=rows)
+        self.emulator = emulator or HD44780Emulator(cols=cols, rows=rows,
+                                                    pinmap=pinmap)
         self.bus_hz = bus_hz
         self._lock = threading.Lock()
 

@@ -308,6 +308,13 @@ SETTINGS: List[Setting] = [
                  "these modules ship.",
             minimum=0, maximum=0x7F, step=1, restart=True,
             formatter=_fmt_addr),
+    Setting("display.pinmap", "Pin map", "enum", "standard",
+            help="How the backpack wires the expander to the display. Two "
+                 "layouts exist; the wrong one shows nothing at all. Run "
+                 "./run.sh --doctor to find yours.",
+            choices=("standard", "ywrobot", "standard-inv", "ywrobot-inv"),
+            choice_labels=("STANDARD", "YWROBOT", "STD-INV", "YW-INV"),
+            restart=True),
     Setting("display.backlight", "Backlight", "bool", True,
             help="Panel backlight."),
     Setting("display.dim_after", "Dim after", "int", 0,
