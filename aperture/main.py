@@ -18,7 +18,9 @@ from . import BUILD_NAME, VERSION
 from .config import Config, config_path
 from .hal import glyphs as G
 from .hal.display import Display
-from .hal.lcd import CANDIDATE_ADDRESSES, CharacterLCD, probe_addresses
+from .hal import pinmap as pinmaps
+from .hal.lcd import (CANDIDATE_ADDRESSES, CharacterLCD, list_buses,
+                      probe_addresses, scan_all_buses)
 from .hal.keyboard import KeyboardHub, enumerate_keyboards
 from .hal.transport import EmulatedTransport, TransportError
 
@@ -37,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
               aperture --sim              mirror the panel in this terminal
               aperture --probe            list I2C addresses and keyboards
               aperture --self-test        draw a test pattern and exit
+              aperture --doctor           diagnose a panel that shows nothing
         """))
     parser.add_argument("--config", metavar="PATH", default=None,
                         help=f"settings file (default: {config_path()})")
@@ -58,6 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="report I2C and input devices, then exit")
     parser.add_argument("--self-test", action="store_true",
                         help="draw a panel test pattern, then exit")
+    parser.add_argument("--doctor", action="store_true",
+                        help="interactively diagnose a panel that shows nothing")
+    parser.add_argument("--pinmap", choices=pinmaps.NAMES, default=None,
+                        help="how the backpack wires the expander to the panel")
     parser.add_argument("--version", action="version",
                         version=f"{BUILD_NAME} {VERSION}")
     return parser
@@ -78,8 +85,9 @@ def open_display(config: Config, args) -> tuple:
 
     if args.sim:
         from .simulator import TerminalSimulator
-        transport = EmulatedTransport(cols=cols, rows=rows)
-        lcd = CharacterLCD(transport, cols=cols, rows=rows)
+        mapping = pinmaps.get(args.pinmap or str(config.get("display.pinmap")))
+        transport = EmulatedTransport(cols=cols, rows=rows, pinmap=mapping)
+        lcd = CharacterLCD(transport, cols=cols, rows=rows, pinmap=mapping)
         lcd.initialise()
         simulator = TerminalSimulator(transport.emulator, mode=args.sim_mode)
         return Display(lcd), simulator
@@ -90,10 +98,12 @@ def open_display(config: Config, args) -> tuple:
         configured = int(config.get("display.i2c_addr", 0))
         address = configured if configured > 0 else None
 
+    mapping = pinmaps.get(args.pinmap or str(config.get("display.pinmap")))
     try:
         lcd = CharacterLCD.open_i2c(bus=bus, address=address or 0x27,
                                     cols=cols, rows=rows,
-                                    autodetect=(address is None))
+                                    autodetect=(address is None),
+                                    pinmap=mapping)
     except TransportError as exc:
         _report_display_failure(exc, bus)
         raise SystemExit(2)
@@ -132,19 +142,32 @@ def command_probe(config: Config, args) -> int:
     print(f"endpoint     {config.base_url}")
     print()
 
-    print(f"I2C bus {bus}:")
-    if not os.path.exists(f"/dev/i2c-{bus}"):
-        print(f"  /dev/i2c-{bus} does not exist -- I2C is not enabled")
+    buses = list_buses()
+    print("I2C:")
+    if not buses:
+        print("  no /dev/i2c-* devices -- I2C is not enabled")
+        print("  enable it with: sudo raspi-config nonint do_i2c 0 && sudo reboot")
     else:
-        found = probe_addresses(bus)
-        if found:
-            for address in found:
-                likely = " (typical PCF8574 backpack)" if address in (0x27, 0x3F) else ""
-                print(f"  0x{address:02X} responds{likely}")
-        else:
-            print("  nothing responded")
-            print(f"  addresses probed: " +
-                  ", ".join(f"0x{a:02X}" for a in CANDIDATE_ADDRESSES))
+        # Every bus, not just the configured one: on a Pi 5 the header has
+        # not always been bus 1, and a panel on an unexpected number should be
+        # found rather than reported as missing.
+        total = 0
+        for number, addresses in scan_all_buses():
+            marker = " (configured)" if number == bus else ""
+            if addresses:
+                total += len(addresses)
+                for address in addresses:
+                    likely = (" <- typical display backpack"
+                              if address in (0x27, 0x3F) else "")
+                    print(f"  bus {number}{marker}: 0x{address:02X} responds{likely}")
+            else:
+                print(f"  bus {number}{marker}: nothing responded")
+        if not total:
+            print("  addresses probed: " +
+                  ", ".join(f"0x{a:02X}" for a in CANDIDATE_ADDRESSES[:8]) + ", ...")
+            print("  run './run.sh --doctor' to work through the causes")
+    mapping = pinmaps.get(str(config.get("display.pinmap")))
+    print(f"  pin map: {mapping.name} ({mapping.pin_summary()})")
     print()
 
     print("Keyboards:")
@@ -171,25 +194,59 @@ def command_probe(config: Config, args) -> int:
 
 
 def command_self_test(config: Config, args) -> int:
-    """Draw a pattern that makes every common wiring fault visible."""
+    """Draw a pattern that makes every common wiring fault visible.
+
+    The pattern is chosen so that each fault produces a *different* wrong
+    result rather than all of them producing a blank panel: the row numbers
+    distinguish a geometry mismatch, the ruler distinguishes a width mismatch,
+    and the block runs stay visible at contrast settings where text does not.
+    """
     display, simulator = open_display(config, args)
     display.use_bank(G.BANK_SYSTEM)
     frame = display.begin_frame()
-    frame.text(0, 0, "12345678901234567890")
-    frame.text(1, 0, "ROW2 " + G.ROM_FULL_BLOCK * 4 + " abcdefghij")
+    frame.text(0, 0, "1:2345678901234567890")
+    frame.text(1, 0, "2:" + G.ROM_FULL_BLOCK * 6 + " abcdefgh")
     glyphs = "".join(display.g(name) for name in
                      ("state", "half", "check", "cross", "warn", "wifi", "bt"))
-    frame.text(2, 0, "ROW3 " + glyphs)
-    frame.text(3, 0, "ROW4 CONTRAST TEST" + G.ROM_FULL_BLOCK)
+    frame.text(2, 0, "3:" + glyphs + " CUSTOM")
+    frame.text(3, 0, "4:" + G.ROM_FULL_BLOCK * 6 + " CONTRAST")
     display.present()
     if simulator is not None:
         simulator.enter()
         simulator.render()
         simulator.leave()
-    print("Test pattern written. Every row should show its own number,")
-    print("row 1 should count 1-20 across the full width, and row 3 should")
-    print("show seven distinct icons. If rows 2 and 4 are blank but 1 and 3")
-    print("are not, the panel is wired as 20x2 -- check the geometry.")
+
+    transport = display.lcd.transport
+    address = getattr(transport, "address", None)
+    stats = display.stats
+    print()
+    print("Wrote a test pattern:")
+    if address is not None:
+        print(f"  bus 0x{getattr(transport, 'bus_number', '?')}, "
+              f"address 0x{address:02X}")
+    else:
+        print("  simulated panel (no hardware)")
+    print(f"  pin map {display.lcd.pinmap.name}: "
+          f"{display.lcd.pinmap.pin_summary()}")
+    print(f"  backlight {'on' if display.backlight else 'off'}, "
+          f"{stats.last_frame_bytes} bytes accepted by the bus")
+    print()
+    print("Each row starts with its own number. You should see:")
+    print("  1:2345678901234567890   a ruler across the full 20 columns")
+    print("  2:######  abcdefgh      solid blocks, then lower case")
+    print("  3:....... CUSTOM        seven distinct icons")
+    print("  4:######  CONTRAST      solid blocks again")
+    print()
+    print("What you actually see tells you which fault it is:")
+    print("  Nothing at all, backlight on ..... contrast, or the pin mapping.")
+    print("                                     Run: ./run.sh --doctor")
+    print("  Solid blocks on every row ........ contrast set too high.")
+    print("  Only rows 1 and 3 ................ the panel is 16x2, not 20x4.")
+    print("  Rows appear as 1,3,2,4 ........... row address map is wrong.")
+    print("  Text but wrong characters ........ bus too fast; try")
+    print("                                     dtparam=i2c_arm_baudrate=100000")
+    print("  Nothing, backlight also off ...... power, ground, or address.")
+    print("                                     Run: ./run.sh --doctor")
     display.close()
     return 0
 
@@ -212,6 +269,9 @@ def main(argv: Optional[list] = None) -> int:
 
     if args.probe:
         return command_probe(config, args)
+    if args.doctor:
+        from .doctor import run as run_doctor
+        return run_doctor(config)
     if args.self_test:
         return command_self_test(config, args)
 

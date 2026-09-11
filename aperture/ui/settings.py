@@ -238,6 +238,7 @@ SECTIONS: dict = {
     ],
     "DISPLAY": [
         Entry(SETTING, key="display.backlight"),
+        Entry(SETTING, key="display.pinmap"),
         Entry(SETTING, key="display.dim_after"),
         Entry(SETTING, key="display.fps"),
         Entry(SETTING, key="display.i2c_bus"),

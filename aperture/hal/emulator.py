@@ -18,9 +18,10 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-# PCF8574 backpack pin assignment.  This is the near-universal wiring used by
-# the Freenove / "LCM1602" style modules: the low nibble carries the control
-# lines and the high nibble carries D4..D7.
+from .pinmap import DEFAULT as DEFAULT_PINMAP, PinMap
+
+# Retained for callers that predate configurable pin maps. These are the
+# standard mapping's masks; anything new should go through a PinMap instead.
 PIN_RS = 0x01
 PIN_RW = 0x02
 PIN_EN = 0x04
@@ -30,9 +31,14 @@ PIN_BACKLIGHT = 0x08
 class HD44780Emulator:
     """Controller state machine fed one PCF8574 port byte at a time."""
 
-    def __init__(self, cols: int = 20, rows: int = 4):
+    def __init__(self, cols: int = 20, rows: int = 4,
+                 pinmap: Optional[PinMap] = None):
         self.cols = cols
         self.rows = rows
+        # Decoding through a pin map rather than fixed masks is what lets a
+        # test drive one wiring and decode with another, and so prove that a
+        # mismatched module really does receive valid traffic and show nothing.
+        self.pinmap = pinmap or DEFAULT_PINMAP
         # Row start addresses.  Note these are *not* in visual order: the
         # controller lays out a 20x4 panel as two 40-character logical lines,
         # each split in half.  Getting this wrong is the classic symptom where
@@ -73,8 +79,9 @@ class HD44780Emulator:
     def write_port(self, value: int) -> None:
         """Consume one byte as latched onto the PCF8574 output port."""
         self.bytes_written += 1
-        self.backlight = bool(value & PIN_BACKLIGHT)
-        en = bool(value & PIN_EN)
+        lit = bool(value & self.pinmap.backlight_bit)
+        self.backlight = (not lit) if self.pinmap.backlight_active_low else lit
+        en = bool(value & self.pinmap.en_bit)
         # The controller latches on the falling edge of E.
         if self._en_high and not en:
             self._latch(value)
@@ -85,10 +92,10 @@ class HD44780Emulator:
             self.write_port(value)
 
     def _latch(self, value: int) -> None:
-        if value & PIN_RW:
+        if value & self.pinmap.rw_bit:
             return  # reads are never issued by this driver
-        rs = value & PIN_RS
-        nibble = (value >> 4) & 0x0F
+        rs = value & self.pinmap.rs_bit
+        nibble = self.pinmap.decode_nibble(value)
 
         if not self.four_bit:
             # During the power-on handshake the controller is still in eight-bit

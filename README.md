@@ -36,6 +36,12 @@ place, and only the cells that actually changed are sent to the panel.
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
 
+> **Nothing on the display?** Run `./run.sh --doctor`. It walks through the
+> causes in order, asking only questions you answer by looking at the panel,
+> and writes the answer into your settings. Start there rather than rewiring —
+> the most common causes are contrast and the backpack's pin mapping, and
+> neither is visible from the outside.
+
 ---
 
 ## Hardware
@@ -137,7 +143,25 @@ If the backlight is on but you see only a row of solid blocks, or nothing at
 all, the contrast is wrong — this is not a fault. Turn the blue trimmer
 potentiometer on the back of the backpack with a small screwdriver while
 `./run.sh --self-test` is displayed. There is a narrow band where the
-characters appear; go slowly.
+characters appear; go slowly. Trimmers are often shipped at one extreme and
+can need fifteen or more turns to cross their range.
+
+### The backpack's pin mapping
+
+The backpack is eight expander outputs wired to the display's control and data
+lines, and **which pin goes where is a property of the board, not of the
+protocol**. Two layouts exist:
+
+| Layout | Wiring | Seen on |
+| --- | --- | --- |
+| `standard` | `P0=RS P1=RW P2=E P3=LED P4..P7=D4..D7` | Almost everything, including Freenove |
+| `ywrobot` | `P0..P3=D4..D7 P4=E P5=RW P6=RS P7=LED` | YwRobot and relabelled clones |
+
+Driven with the wrong one, a module receives perfectly valid I2C traffic,
+acknowledges every byte, and displays nothing — and the backlight may still
+work, because that pin happens to be independent. It is the hardest fault here
+to spot from software, which is why `--doctor` exists and why the mapping is a
+setting (Settings → DISPLAY → `Pin map`, or `./run.sh --pinmap ywrobot`).
 
 ---
 
@@ -192,6 +216,7 @@ curl -L -o models/qwen2.5-3b-instruct-q4_k_m.gguf \
 ./run.sh                # normal operation
 ./run.sh --probe        # what is on the I2C bus, which keyboards, which models
 ./run.sh --self-test    # a test pattern for checking wiring and contrast
+./run.sh --doctor       # diagnose a panel that shows nothing
 ./run.sh --sim          # no hardware: mirror the panel in this terminal
 ```
 
@@ -361,6 +386,7 @@ hardest kind of fault to attribute.
 | CONVERSATION | Stream fps | `12` | 2 to 30, step 1 | Upper bound on display refreshes per second. The bus, not the model, is the limit here. |
 | CONVERSATION | Keep log | `ON` | on / off | Append each exchange to a transcript file under the state directory. |
 | DISPLAY | Backlight | `ON` | on / off | Panel backlight. |
+| DISPLAY | Pin map | `STANDARD` | STANDARD / YWROBOT / STANDARD-INV / YWROBOT-INV | How the backpack wires the expander to the display. Two layouts exist; the wrong one shows nothing at all. Run ./run.sh --doctor to find yours. Restarts the engine. |
 | DISPLAY | Dim after | `NEVER` | 0 to 3600, step 30 | Switch the backlight off after this long with no keystroke. NEVER keeps it on. |
 | DISPLAY | Refresh | `20` | 5 to 40, step 1 | Render loop target. Frames with nothing to redraw cost nothing, so this is a ceiling rather than a load. |
 | DISPLAY | I2C bus | `1` | 0 to 20, step 1 | Bus number. Header pins 3 and 5 are bus 1 on every Pi. Restarts the engine. |
@@ -424,26 +450,61 @@ time to first token, and the panel's own bytes-per-frame.
 
 ## Troubleshooting
 
-**Run `./run.sh --probe` first.** It reports the I2C bus, every address that
-responds, every keyboard it can see and whether it can read them, where
-`llama-server` is, and which models it found.
+### The display shows nothing
+
+```bash
+./run.sh --doctor
+```
+
+This is the tool for it. It bisects the causes rather than guessing, using one
+fact: of the eight expander pins, **the backlight is the only one whose effect
+needs no part of the display protocol** — no four-bit handshake, no enable
+timing, no register select, no contrast. Writing one byte toggles it. So:
+
+- **the backlight responds** → the bus, address, wiring, power and ground are
+  all proven good, and the fault is above the bus: pin mapping, or contrast.
+  It then works out which.
+- **the backlight does not** → the fault is at or below the bus, and no
+  protocol work will help. It says what is left and stops.
+
+It writes the bus, address and pin mapping it finds into your settings.
+
+### Reading the self-test
+
+`./run.sh --self-test` draws a pattern designed so each fault looks *different*
+rather than all of them looking blank:
+
+| What you see | What it means |
+| --- | --- |
+| Nothing, backlight on | Contrast, or the pin mapping. Run `--doctor`. |
+| Nothing, backlight off too | Power, ground, or address. Run `--doctor`. |
+| Solid blocks on every row | Contrast turned too far up. |
+| Only rows 1 and 3 | It is a 16x2 panel, not 20x4. |
+| Rows in the order 1, 3, 2, 4 | The row address map is wrong for this panel. |
+| Text, but wrong characters | Bus too fast. Set `dtparam=i2c_arm_baudrate=100000`. |
+
+### Everything else
+
+`./run.sh --probe` reports every I2C bus and what answers on each, every
+keyboard and whether it is readable, where `llama-server` is, and which models
+were found. On a Pi 5 it scans *all* buses, not just bus 1 — which bus the
+header lands on has moved between kernel releases.
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `/dev/i2c-1 does not exist` | I2C is not enabled. `sudo raspi-config nonint do_i2c 0`, then reboot. |
-| Nothing responds on the bus | Wiring. Check ground first, then that SDA and SCL are not swapped. |
-| Backlight on, screen blank or solid blocks | Contrast. Turn the trimmer on the back while `--self-test` is showing. |
-| Rows 1 and 3 show text, rows 2 and 4 blank | The panel is being driven as 20x2. Confirm it is a 20x4 module. |
-| Garbled or drifting characters | Loose jumper, or a long/unshielded cable at 400 kHz. Reseat; if it persists, set `dtparam=i2c_arm_baudrate=100000`. |
-| `permission denied` on input devices | You are not in the `input` group yet. `sudo usermod -aG input $USER`, then log out and back in. |
-| Keys reach a login shell as well as the terminal | The exclusive grab failed. Settings → INPUT → `Grab keys`, and check `F6` → `INPUT`. |
-| Bluetooth keyboard will not pair | Put it in pairing mode *first*, then `F7` → INPUT → Bluetooth. Type the passkey shown on the panel on that keyboard and press ENTER. |
+| `no /dev/i2c-* devices` | I2C is not enabled. `sudo raspi-config nonint do_i2c 0`, then reboot. |
+| Nothing responds on any bus | Wiring. Ground first (pin 6), then check SDA and SCL are not swapped. |
+| `i2cdetect` sees it but this does not | Report it — that is a bug. Include `./run.sh --probe` output. |
+| Garbled or drifting characters | Loose jumper, or a long cable at 400 kHz. Reseat; if it persists set `dtparam=i2c_arm_baudrate=100000`. |
+| `permission denied` on input devices | Not in the `input` group yet. `sudo usermod -aG input $USER`, then log out and back in. |
+| Keys reach a login shell as well | The exclusive grab failed. Settings → INPUT → `Grab keys`, and check `F6` → `INPUT`. |
+| Bluetooth keyboard will not pair | Put it in pairing mode *first*, then `F7` → INPUT → Bluetooth. Type the passkey shown on the panel on that keyboard, then ENTER. |
 | `NO llama-server` | Not built. `./install.sh --with-llama`, or set the path in Settings → ENDPOINT. |
 | `NO MODEL FOUND` | No `.gguf` in `models/`. Drop one in and press `ENTER`. |
 | `OUT OF MEMORY` on startup | Model too large, or context too high. Lower Context (it moves in 512s) or use a smaller quantisation. |
-| Engine times out loading | Normal for a large model on a slow card the first time — the page cache is cold. `F6` → `ENGINE LOG` shows progress. |
-| Replies are slow but correct | Check `F6` → `HOST` for `POWER UNDERVOLT`. An inadequate supply throttles the Pi hard. |
-| Replies arrive as markdown or paragraphs | The persona instructs against it, but small models drift. Settings → CONVERSATION → `Persona` → `TERSE`. |
+| Engine times out loading | Normal for a large model on a cold page cache. `F6` → `ENGINE LOG` shows progress. |
+| Replies slow but correct | Check `F6` → `HOST` for `POWER UNDERVOLT`. An inadequate supply throttles the Pi hard. |
+| Replies arrive as markdown | Small models drift despite the persona. Settings → CONVERSATION → `Persona` → `TERSE`. |
 
 ---
 
@@ -463,6 +524,13 @@ means the panel would show what the tests assert. It covers the controller's
 address map, differential rendering cost, the equivalence of streamed and
 batch word wrapping under randomly chunked input, keyboard decoding on both
 input paths, GGUF parsing, and the prompt-cache behaviour end to end.
+
+The emulator decodes through a pin map rather than fixed bit masks, so a test
+can drive one wiring and decode with another — which is how the "valid traffic,
+blank panel" failure is asserted to be real rather than assumed. `--doctor`
+itself is tested against a simulated module of each wiring, with a stand-in
+operator answering from what the emulated panel would be showing, because a
+diagnostic that reaches the wrong conclusion is worse than none.
 
 ```
 aperture/
