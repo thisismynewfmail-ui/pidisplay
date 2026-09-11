@@ -1,0 +1,279 @@
+"""
+HD44780 driver for PCF8574-backpacked character panels (Freenove LCD2004 etc).
+
+The driver deliberately exposes a *batched* interface.  Callers stage a series
+of operations -- move the cursor, write a run of text, reprogram a CGRAM slot --
+and then flush, at which point every staged byte goes out as a small number of
+I2C messages.  A naive per-character driver spends most of its time in bus
+turnaround; this one spends it moving pixels.
+
+Cost model, for anyone tuning the UI: one displayed character is six port
+bytes, one cursor move is six, and one CGRAM slot reload is fifty-four.  At the
+400 kHz bus speed install.sh configures, a full 20x4 repaint is about 11 ms and
+a typical differential repaint is under 2 ms.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import List, Optional, Sequence
+
+from .emulator import PIN_BACKLIGHT, PIN_EN, PIN_RS
+from .transport import I2CTransport, Transport, TransportError
+
+# Instruction set ------------------------------------------------------------
+CMD_CLEAR = 0x01
+CMD_HOME = 0x02
+CMD_ENTRY_MODE = 0x04
+CMD_DISPLAY_CTRL = 0x08
+CMD_FUNCTION_SET = 0x20
+CMD_SET_CGRAM = 0x40
+CMD_SET_DDRAM = 0x80
+
+ENTRY_INCREMENT = 0x02
+DISPLAY_ON = 0x04
+CURSOR_ON = 0x02
+BLINK_ON = 0x01
+FUNC_2LINE = 0x08
+FUNC_5x8 = 0x00
+
+#: Addresses PCF8574 backpacks are strapped to from the factory.  The PCF8574
+#: lands at 0x20-0x27 and the PCF8574A at 0x38-0x3F; 0x27 and 0x3F are the two
+#: you will meet in practice because they are the all-pins-high defaults.
+CANDIDATE_ADDRESSES = (0x27, 0x3F, 0x26, 0x3E, 0x20, 0x21, 0x22, 0x23,
+                       0x24, 0x25, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D)
+
+
+def probe_addresses(bus: int = 1) -> List[int]:
+    """Return I2C addresses that answer on *bus* and look like a backpack.
+
+    Probing is a zero-byte write, which is what ``i2cdetect`` does for this
+    address range; a PCF8574 acknowledges it without changing its outputs.
+    """
+    try:
+        from smbus2 import SMBus, i2c_msg
+    except ImportError:
+        return []
+    found = []
+    try:
+        with SMBus(bus) as smbus:
+            for address in CANDIDATE_ADDRESSES:
+                try:
+                    smbus.i2c_rdwr(i2c_msg.write(address, b""))
+                except OSError:
+                    continue
+                found.append(address)
+    except (OSError, IOError):
+        return []
+    return found
+
+
+class CharacterLCD:
+    """A 20x4 (or other geometry) HD44780 panel behind a PCF8574."""
+
+    def __init__(self, transport: Transport, cols: int = 20, rows: int = 4):
+        self.transport = transport
+        self.cols = cols
+        self.rows = rows
+        self.row_offsets = self._row_offsets(cols, rows)
+        self._backlight = True
+        self._display_ctrl = CMD_DISPLAY_CTRL | DISPLAY_ON
+        self._pending: List[int] = []
+        # The controller auto-increments its address counter, so consecutive
+        # writes to consecutive cells need no cursor move.  Tracking where the
+        # counter is lets the renderer skip those moves.
+        self._address: Optional[int] = None
+        self.initialised = False
+
+    @staticmethod
+    def _row_offsets(cols: int, rows: int) -> List[int]:
+        if rows == 1:
+            return [0x00]
+        if rows == 2:
+            return [0x00, 0x40]
+        return [0x00, 0x40, 0x00 + cols, 0x40 + cols]
+
+    # -- construction helpers ----------------------------------------------
+
+    @classmethod
+    def open_i2c(cls, bus: int = 1, address: int = 0x27, cols: int = 20,
+                 rows: int = 4, autodetect: bool = True) -> "CharacterLCD":
+        """Open a panel on a real bus, optionally hunting for its address.
+
+        Autodetection exists because these modules ship strapped to either 0x27
+        or 0x3F with no markings, and asking a first-time user to run
+        ``i2cdetect`` before the program will start is a bad first impression.
+        """
+        if autodetect:
+            found = probe_addresses(bus)
+            if found and address not in found:
+                address = found[0]
+        lcd = cls(I2CTransport(bus=bus, address=address), cols=cols, rows=rows)
+        lcd.initialise()
+        return lcd
+
+    # -- byte encoding ------------------------------------------------------
+
+    def _bl_bit(self) -> int:
+        return PIN_BACKLIGHT if self._backlight else 0
+
+    def _encode(self, value: int, rs: int) -> List[int]:
+        """One controller byte as six PCF8574 port bytes.
+
+        Three writes per nibble: data stable, data+E, data again.  Collapsing
+        this to two writes (the trick some Arduino libraries use) violates the
+        40 ns address-setup time before E rises, because the expander switches
+        every output at once.  Most panels tolerate it; the ones that do not
+        fail as intermittent garbage characters, which is a miserable thing to
+        debug.  The third write costs nothing worth having.
+        """
+        backlight = self._bl_bit()
+        high = (value & 0xF0) | rs | backlight
+        low = ((value << 4) & 0xF0) | rs | backlight
+        return [high, high | PIN_EN, high,
+                low, low | PIN_EN, low]
+
+    def _stage(self, data: Sequence[int]) -> None:
+        self._pending.extend(data)
+
+    def command(self, value: int) -> None:
+        self._stage(self._encode(value, 0))
+        self._address = None
+
+    def _data(self, value: int) -> None:
+        self._stage(self._encode(value, PIN_RS))
+
+    def flush(self) -> None:
+        """Send everything staged so far as one or more I2C bursts."""
+        if not self._pending:
+            return
+        payload, self._pending = self._pending, []
+        self.transport.write(payload)
+
+    # -- power-on --------------------------------------------------------
+
+    def initialise(self) -> None:
+        """Run the datasheet's power-on sequence into four-bit mode.
+
+        The controller wakes up in eight-bit mode and cannot be assumed to be
+        in any particular state -- a warm restart of this program may find it
+        mid-byte from the previous run.  The triple 0x30 resets that: whatever
+        the internal nibble phase was, three eight-bit function-set commands
+        leave it deterministic, and only then is it safe to select four-bit.
+        """
+        time.sleep(0.05)
+        for delay in (0.0045, 0.0045, 0.00015):
+            self._write_nibble(0x30)
+            self.flush()
+            time.sleep(delay)
+        self._write_nibble(0x20)  # four-bit mode from here on
+        self.flush()
+        time.sleep(0.00015)
+
+        self.command(CMD_FUNCTION_SET | FUNC_2LINE | FUNC_5x8)
+        self.command(CMD_DISPLAY_CTRL)  # display off while we set up
+        self.command(CMD_CLEAR)
+        self.flush()
+        time.sleep(0.002)  # clear needs 1.52 ms and does not ack
+        self.command(CMD_ENTRY_MODE | ENTRY_INCREMENT)
+        self._display_ctrl = CMD_DISPLAY_CTRL | DISPLAY_ON
+        self.command(self._display_ctrl)
+        self.flush()
+        self._address = None
+        self.initialised = True
+
+    def _write_nibble(self, value: int) -> None:
+        backlight = self._bl_bit()
+        byte = (value & 0xF0) | backlight
+        self._stage([byte, byte | PIN_EN, byte])
+
+    # -- drawing -----------------------------------------------------------
+
+    def clear(self) -> None:
+        self.command(CMD_CLEAR)
+        self.flush()
+        time.sleep(0.002)
+        self._address = 0
+
+    def set_cursor(self, row: int, col: int) -> None:
+        address = self.row_offsets[row] + col
+        if self._address == address:
+            return
+        self.command(CMD_SET_DDRAM | address)
+        self._address = address
+
+    def write_text(self, text: str) -> None:
+        """Write *text* at the current address, advancing the counter."""
+        for ch in text:
+            self._data(ord(ch) & 0xFF)
+        if self._address is not None:
+            self._address += len(text)
+
+    def write_at(self, row: int, col: int, text: str) -> None:
+        self.set_cursor(row, col)
+        self.write_text(text)
+
+    def load_glyph(self, slot: int, pattern: Sequence[int]) -> None:
+        """Reprogram one CGRAM slot.
+
+        Writing CGRAM moves the address counter into character memory, so the
+        DDRAM position is lost and the next draw must re-address.  Callers that
+        batch glyph loads with text should load glyphs first.
+        """
+        self.command(CMD_SET_CGRAM | ((slot & 0x07) << 3))
+        for row in range(8):
+            self._data(pattern[row] & 0x1F)
+        self._address = None
+
+    # -- panel state -------------------------------------------------------
+
+    @property
+    def backlight(self) -> bool:
+        return self._backlight
+
+    @backlight.setter
+    def backlight(self, value: bool) -> None:
+        value = bool(value)
+        if value == self._backlight:
+            return
+        self._backlight = value
+        # The backlight bit rides along with every transfer, so it takes effect
+        # on the next byte regardless; sending a no-op keeps it immediate.
+        self._stage([self._bl_bit()])
+        self.flush()
+
+    def set_cursor_style(self, visible: bool = False, blinking: bool = False) -> None:
+        """Enable the controller's own cursor.
+
+        Used for the compose-line caret.  Letting the controller blink it costs
+        no bus traffic and no frames, and it blinks at a rate that reads as
+        native because it is.
+        """
+        ctrl = CMD_DISPLAY_CTRL | DISPLAY_ON
+        if visible:
+            ctrl |= CURSOR_ON
+        if blinking:
+            ctrl |= BLINK_ON
+        if ctrl == self._display_ctrl:
+            return
+        self._display_ctrl = ctrl
+        self.command(ctrl)
+
+    def set_display_on(self, on: bool) -> None:
+        ctrl = self._display_ctrl
+        ctrl = (ctrl | DISPLAY_ON) if on else (ctrl & ~DISPLAY_ON)
+        if ctrl == self._display_ctrl:
+            return
+        self._display_ctrl = ctrl
+        self.command(ctrl)
+        self.flush()
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        except TransportError:
+            pass
+        try:
+            self.transport.close()
+        except Exception:
+            pass
